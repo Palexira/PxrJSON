@@ -1,0 +1,63 @@
+# Cursor IDE (local rules, not part of the repo)
+.cursor/
+
+# Delphi compiler output at repo root (dproj: .\$(Platform)\$(Config))
+# Leading / = only these folders, not bin/Win64 or bin/Linux64
+/Win32/
+/Win64/
+/Linux64/
+/Android/
+/Android64/
+/OSX64/
+/OSXARM64/
+/iOSDevice64/
+/iOSSimARM64/
+
+# Units, maps, debug
+*.dcu
+*.dcp
+*.dcpil
+*.drc
+*.map
+*.rsm
+*.tds
+*.o
+*.obj
+*.ppu
+*.a
+*.so
+*.dylib
+
+# Binaries (except the shipped plugin in bin/)
+*.exe
+*.dll
+*.bpl
+*.bpi
+*.apk
+!/bin/**/*.dll
+!/bin/**/*.so
+
+# RAD Studio / IDE local state
+*.local
+*.identcache
+*.dsk
+*.skincfg
+*.stat
+*.mes
+*.otares
+__history/
+__recovery/
+*.~*
+*.bak
+
+# Auto-generated resource (empty for this library)
+*.res
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+*~
+*.swp
+.vscode/
+.idea/
