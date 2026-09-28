@@ -8,7 +8,7 @@ Firebird has no JSON type. The packages cover two jobs: **parse** incoming JSON 
 
 For speed and memory the UDR keeps a buffer per connection (attachment):
 
-- a repeat call with the **same JSON text** does not parse again (last **64** distinct texts);
+- a repeat call with the **same JSON text** does not parse again (last **64** distinct texts, up to 16M characters of text in total; the two most recent texts are always kept, so one large document still works);
 - `PARSE` stores the tree in a separate UDR buffer and returns a **key**. `CLONE` makes an independent copy and also returns a key. After that you can read and change JSON many times without parsing or serializing after every edit — pass the key instead of the text. To get text from a key, call `ToJSON`. The key lives until `Free(key)` or the Firebird session ends. Until then it can be used from any procedure, trigger, or function **of that same connection**.
 
 Function names are the same in both packages. Always qualify: `SJSON.GET_S(...)`, `BJSON.PARSE(...)`.
@@ -111,7 +111,9 @@ Reading by path **creates nothing**: missing node → SQL `NULL` / `EXIST` = `FA
 
 Writing (`SET_*`, `ADD_*`, `INS_*`): if an intermediate object or array on the path **is missing**, it is created (empty, then the write continues). If the node **already exists**, it is left as-is, not recreated or cleared. You can build JSON from scratch (`SET_S('{}', 'user.address.city', 'NY')` creates `user` and `address`) and also extend an existing tree.
 
-Array indexes are zero-based. Missing index: **read** behaves as “path not found” (SQL `NULL`, `EXIST` = `FALSE`); **write** → exception. Arrays are not stretched with holes: with 5 elements you cannot `SET` `[10]`. `ADD_*` always appends. `INS_*` inserts at `0` .. current `LEN` inclusive (insert at the end is allowed).
+The whole write path is checked **before** anything is created. If the write fails (index out of range, JSON `null` or a scalar on the way, invalid `json_value`, bad `INS_*` index), no empty intermediate objects or arrays are left behind, and the tree cached for a JSON text passed as the first argument is not affected. Nested arrays work in both directions: `matrix[0][1]` reads and writes an element of an inner array.
+
+Array indexes are zero-based. Missing index: **read** behaves as “path not found” (SQL `NULL`, `EXIST` = `FALSE`); **write** → exception. Arrays are not stretched with holes: with 5 elements you cannot `SET` `[10]`. `ADD_*` always appends. `INS_*` inserts at `0` .. current `LEN` inclusive (insert at the end is allowed). An index in the path that does not fit `INTEGER` is treated like any other missing index.
 
 ### 1.4. SQL NULL and JSON `null`
 
@@ -359,7 +361,7 @@ select * from SJSON.NODES(:j, 'address', true);
 | `NAME` | field name; for an array element `'[n]'`; for the JSON root — empty |
 | `PATH` | see `A_FULL_PATH` |
 | `TYP` | as `GET_TYPE` |
-| `VAL` | scalar as `GET_S` (empty string is an empty field, not `""`); number / `true` / `false` as text; JSON `null` → **SQL NULL**; object/array — only markers `{}` / `[]`, not full content (children follow as later rows) |
+| `VAL` | scalar as `GET_S` (empty string is an empty field, not `""`); number / `true` / `false` as text; JSON `null` → **SQL NULL**; object/array — only markers `{}` / `[]`, not full content (children follow as later rows). Type: `VARCHAR(8191)` in `SJSON`, `BLOB SUB_TYPE TEXT` in `BJSON` |
 
 Missing path or `A_JSON` SQL `NULL` → 0 rows, not an exception.
 
@@ -378,7 +380,7 @@ select * from SJSON.ITEMS(:j, 'phoneNumbers');
 | `LOC_INDEX` | array element index (0, 1, …) |
 | `NAME` | field name inside the object; if the element is a scalar, array, or JSON `null` — `'[n]'` |
 | `TYP` | as `GET_TYPE` |
-| `VAL` | scalar as in `NODES` (JSON `null` → SQL NULL); nested object/array — **full** compact JSON (as `GET`), because the procedure does not descend |
+| `VAL` | scalar as in `NODES` (JSON `null` → SQL NULL); nested object/array — **full** compact JSON (as `GET`), because the procedure does not descend. Type: `VARCHAR(8191)` in `SJSON`, `BLOB SUB_TYPE TEXT` in `BJSON` (a nested value of any size fits) |
 
 Empty array, missing path, `A_JSON` SQL `NULL` → 0 rows. If the path is not an array (object, scalar, JSON `null`) → exception `ITEMS path is not an array`.
 

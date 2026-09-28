@@ -37,10 +37,12 @@ type
     FOutMeta: IMessageMetadata;
     FRows: TList<TJsonNodeRow>;
     FIndex: Integer;
+    FAtt: IAttachment;    { held only when VAL is a BLOB (BJSON) }
+    FTra: ITransaction;
     procedure WriteRow(AStatus: IStatus; const ARow: TJsonNodeRow);
   public
     constructor Create(AKind: TJsonSelKind; AOutMsg: Pointer; AOutMeta: IMessageMetadata;
-      ARows: TList<TJsonNodeRow>);
+      ARows: TList<TJsonNodeRow>; AAtt: IAttachment; ATra: ITransaction);
     procedure dispose; override;
     function fetch(AStatus: IStatus): Boolean; override;
   end;
@@ -104,7 +106,8 @@ begin
 end;
 
 constructor TJsonNodesResultSet.Create(AKind: TJsonSelKind; AOutMsg: Pointer;
-  AOutMeta: IMessageMetadata; ARows: TList<TJsonNodeRow>);
+  AOutMeta: IMessageMetadata; ARows: TList<TJsonNodeRow>; AAtt: IAttachment;
+  ATra: ITransaction);
 begin
   inherited Create;
   FKind := AKind;
@@ -112,6 +115,8 @@ begin
   FOutMeta := AOutMeta;
   FRows := ARows;
   FIndex := 0;
+  FAtt := AAtt;
+  FTra := ATra;
 end;
 
 procedure TJsonNodesResultSet.dispose;
@@ -119,6 +124,10 @@ begin
   FRows.Free;
   if FOutMeta <> nil then
     FOutMeta.release;
+  if FTra <> nil then
+    FTra.release;
+  if FAtt <> nil then
+    FAtt.release;
   Destroy;
 end;
 
@@ -128,6 +137,8 @@ procedure TJsonNodesResultSet.WriteRow(AStatus: IStatus; const ARow: TJsonNodeRo
   begin
     if ARow.Typ = 'null' then
       FbSetNull(FOutMsg, FOutMeta, AStatus, AIndex, True)
+    else if FAtt <> nil then
+      FbWriteBlobAt(FOutMsg, FOutMeta, AStatus, FAtt, FTra, AIndex, ARow.Val)
     else
       FbWriteVarChar(FOutMsg, FOutMeta, AStatus, AIndex, ARow.Val);
   end;
@@ -215,11 +226,16 @@ var
   FullPath: Boolean;
   Doc: TJsonBaseObject;
   Rows: TList<TJsonNodeRow>;
+  ValIdx: Cardinal;
+  Att: IAttachment;
+  Tra: ITransaction;
 begin
   Result := nil;
   Rows := nil;
   InMeta := nil;
   OutMeta := nil;
+  Att := nil;
+  Tra := nil;
   try
     InMeta := FMetadata.getInputMetadata(AStatus);
     OutMeta := FMetadata.getOutputMetadata(AStatus);
@@ -243,9 +259,21 @@ begin
         JsonCollectNodes(Doc, Path, FullPath, Rows);
       end;
     end;
-    Result := TJsonNodesResultSet.Create(FKind, AOutMsg, OutMeta, Rows);
+    { VAL column: BLOB in BJSON (value may be a whole nested JSON), VARCHAR in SJSON }
+    if FKind = skItems then
+      ValIdx := 3
+    else
+      ValIdx := 5;
+    if (Rows.Count > 0) and (FbSqlType(OutMeta, AStatus, ValIdx) = SQL_BLOB) then
+    begin
+      Att := AContext.getAttachment(AStatus);
+      Tra := AContext.getTransaction(AStatus);
+    end;
+    Result := TJsonNodesResultSet.Create(FKind, AOutMsg, OutMeta, Rows, Att, Tra);
     OutMeta := nil;
     Rows := nil;
+    Att := nil;
+    Tra := nil;
   except
     on E: Exception do
       FbException.catchException(AStatus, E);
@@ -254,6 +282,10 @@ begin
     InMeta.release;
   if OutMeta <> nil then
     OutMeta.release;
+  if Tra <> nil then
+    Tra.release;
+  if Att <> nil then
+    Att.release;
   Rows.Free;
 end;
 

@@ -37,6 +37,8 @@ function FbReadBlob(AMsg: Pointer; AMeta: IMessageMetadata; AStatus: IStatus;
   AContext: IExternalContext; AIndex: Cardinal): string;
 procedure FbWriteBlob(AMsg: Pointer; AMeta: IMessageMetadata; AStatus: IStatus;
   AContext: IExternalContext; AIndex: Cardinal; const AValue: string);
+procedure FbWriteBlobAt(AMsg: Pointer; AMeta: IMessageMetadata; AStatus: IStatus;
+  AAtt: IAttachment; ATra: ITransaction; AIndex: Cardinal; const AValue: string);
 
 function FbReadInt64(AMsg: Pointer; AMeta: IMessageMetadata; AStatus: IStatus;
   AIndex: Cardinal; ADefault: Int64): Int64;
@@ -217,20 +219,35 @@ end;
 procedure FbWriteBlob(AMsg: Pointer; AMeta: IMessageMetadata; AStatus: IStatus;
   AContext: IExternalContext; AIndex: Cardinal; const AValue: string);
 var
-  Quad: ISC_QUADPtr;
   Att: IAttachment;
   Tra: ITransaction;
+begin
+  Att := AContext.getAttachment(AStatus);
+  Tra := nil;
+  try
+    Tra := AContext.getTransaction(AStatus);
+    FbWriteBlobAt(AMsg, AMeta, AStatus, Att, Tra, AIndex, AValue);
+  finally
+    if Tra <> nil then
+      Tra.release;
+    if Att <> nil then
+      Att.release;
+  end;
+end;
+
+procedure FbWriteBlobAt(AMsg: Pointer; AMeta: IMessageMetadata; AStatus: IStatus;
+  AAtt: IAttachment; ATra: ITransaction; AIndex: Cardinal; const AValue: string);
+var
+  Quad: ISC_QUADPtr;
   Blob: IBlob;
   Bytes: TBytes;
   Off, Chunk, N: Integer;
 begin
   Quad := ISC_QUADPtr(PByte(AMsg) + AMeta.getOffset(AStatus, AIndex));
   Bytes := TEncoding.UTF8.GetBytes(AValue);
-  Att := AContext.getAttachment(AStatus);
-  Tra := AContext.getTransaction(AStatus);
   Blob := nil;
   try
-    Blob := Att.createBlob(AStatus, Tra, Quad, 0, nil);
+    Blob := AAtt.createBlob(AStatus, ATra, Quad, 0, nil);
     FbException.checkException(AStatus);
     Off := 0;
     N := Length(Bytes);
@@ -243,20 +260,14 @@ begin
       FbException.checkException(AStatus);
       Inc(Off, Chunk);
     end;
-    if N = 0 then
-    begin
-      { empty blob is valid }
-    end;
+    { N = 0: an empty blob is valid }
     Blob.close(AStatus);
     Blob := nil;
+    FbException.checkException(AStatus);
     FbSetNull(AMsg, AMeta, AStatus, AIndex, False);
   finally
     if Blob <> nil then
       Blob.release;
-    if Tra <> nil then
-      Tra.release;
-    if Att <> nil then
-      Att.release;
   end;
 end;
 

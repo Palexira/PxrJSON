@@ -16,7 +16,8 @@ The parser is [JsonDataObjects](https://github.com/ahausladen/JsonDataObjects) (
 - Typed getters and setters: `GET_S`, `GET_I`, `GET_L`, `GET_F`, `GET_B`, `GET_D`, `SET_*`, plus `GET` / `SET_J` for a whole node as JSON text
 - Arrays: `GET_AT_*` / `SET_AT_*`, `ADD_*`, `INS_*`, `REMOVE` / `REMOVE_AT`
 - Session cache: `PARSE` returns a `CHAR(36)` key; further calls use the key instead of resending the document. `CLONE`, `Free`, `ToJSON`, `KeySize`
-- Hash LRU of the last **64** distinct JSON texts per attachment (repeat `GET_*` on the same VARCHAR/BLOB string does not re-parse)
+- Hash LRU of the last **64** distinct JSON texts per attachment, up to 16M characters in total (repeat `GET_*` on the same VARCHAR/BLOB string does not re-parse)
+- Writes are all-or-nothing on the path: a failed `SET_*` / `ADD_*` / `INS_*` leaves no half-built nodes; nested arrays (`m[0][1]`) work for read and write
 - `EXTRACTJSON` / `EXTRACTKEY` — cut a node and return it as text or a new key
 - Selectable procedures `NODES` (DFS) and `ITEMS` (one array level as a table)
 - Win64 (`PxrJSON.dll`) and Linux64 (`libPxrJSON.so`)

@@ -337,6 +337,7 @@ begin
 
     Doc := FCache.Resolve(Json);
 
+    try
     case FKind of
       jkGetS:
         if JsonGetS(Doc, Path, SVal) then
@@ -648,6 +649,13 @@ begin
               Work.Free;
           end;
         end;
+    end;
+    except
+      { A failed call on a JSON text may have left the cached tree of that
+        text half-changed; drop it so the next call re-parses the text. }
+      if not IsJsonCacheKey(Json) then
+        FCache.Forget(Json);
+      raise;
     end;
   finally
     InMeta.release;

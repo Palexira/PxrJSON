@@ -143,21 +143,30 @@ begin
 end;
 
 function ParseIndex(var P: PChar; const APath: string): Integer;
+var
+  V: Int64;
 begin
+  { Index above High(Integer) is clamped: read -> "no such element",
+    write -> out of bounds. No silent wrap to a negative index. }
   if P^ <> '[' then
     PathError(APath);
   Inc(P);
-  if not (P^ in ['0'..'9']) then
+  if not CharInSet(P^, ['0'..'9']) then
     PathError(APath);
-  Result := 0;
-  while P^ in ['0'..'9'] do
+  V := 0;
+  while CharInSet(P^, ['0'..'9']) do
   begin
-    Result := Result * 10 + (Ord(P^) - Ord('0'));
+    if V <= High(Integer) then
+      V := V * 10 + (Ord(P^) - Ord('0'));
     Inc(P);
   end;
   if P^ <> ']' then
     PathError(APath);
   Inc(P);
+  if V > High(Integer) then
+    Result := High(Integer)
+  else
+    Result := Integer(V);
 end;
 
 function ParseName(var P: PChar; const APath: string): string;
@@ -165,7 +174,7 @@ var
   S: PChar;
 begin
   S := P;
-  while not (P^ in [#0, '.', '[']) do
+  while not CharInSet(P^, [#0, '.', '[']) do
     Inc(P);
   if P = S then
     PathError(APath);
@@ -280,15 +289,51 @@ begin
   end;
 end;
 
-procedure WalkWrite(ADoc: TJsonBaseObject; const APath: string; out Sink: TSink);
+procedure PathTypeError(const APath, AWhat: string);
+begin
+  raise EJsonUdr.CreateFmt('JSON path segment is not an %s "%s"', [AWhat, APath]);
+end;
+
+{ One pass over the write path.
+  ADryRun = True: nothing is created; missing containers are only "virtual".
+  Every error a real pass could raise (bad syntax, JSON null / wrong type on
+  the way, index out of bounds - including an index into a not yet created
+  array) is raised here, so the real pass never fails half-way and never
+  leaves empty intermediate objects/arrays behind. }
+procedure WalkWritePass(ADoc: TJsonBaseObject; const APath: string;
+  ADryRun: Boolean; out Sink: TSink);
 var
   P: PChar;
   CurObj: TJsonObject;
   CurArr: TJsonArray;
-  CurItem: PJsonDataValue;
+  InArr: Boolean;    { current container is an array (else an object) }
+  Virt: Boolean;     { current container does not exist yet (dry run only) }
+  Item: PJsonDataValue;
   Name: string;
   Idx: Integer;
-  Last: Boolean;
+
+  { Step into an existing item: next container must be of the expected kind }
+  procedure EnterItem(AItem: PJsonDataValue; AWantArray: Boolean);
+  begin
+    if AItem.IsNull then
+      PathNullError(APath);
+    if AWantArray then
+    begin
+      if AItem.Typ <> jdtArray then
+        PathTypeError(APath, 'array');
+      CurArr := AItem.ArrayValue;
+      CurObj := nil;
+    end
+    else
+    begin
+      if AItem.Typ <> jdtObject then
+        PathTypeError(APath, 'object');
+      CurObj := AItem.ObjectValue;
+      CurArr := nil;
+    end;
+    InArr := AWantArray;
+  end;
+
 begin
   Sink := Default(TSink);
   Sink.IsRoot := APath = '';
@@ -297,101 +342,121 @@ begin
 
   CurObj := nil;
   CurArr := nil;
-  CurItem := nil;
-  if ADoc is TJsonArray then
+  Virt := False;
+  InArr := ADoc is TJsonArray;
+  if InArr then
     CurArr := TJsonArray(ADoc)
   else
     CurObj := TJsonObject(ADoc);
 
   P := PChar(APath);
-  if CurArr <> nil then
-  begin
-    if P^ <> '[' then
-      PathError(APath);
-  end
-  else if P^ = '[' then
+  if InArr <> (P^ = '[') then
     PathError(APath);
 
   while True do
   begin
-    if (CurArr <> nil) or ((CurItem = nil) and (CurObj = nil) and (P^ = '[')) then
+    if InArr then
     begin
-      { array index }
-      if CurArr = nil then
-        PathError(APath);
       Idx := ParseIndex(P, APath);
-      Last := P^ = #0;
+      if Virt then
+        PathIndexError(APath, 0);
       if Idx >= CurArr.Count then
         PathIndexError(APath, CurArr.Count);
-      if Last then
+      if P^ = #0 then
       begin
         Sink.ParentArr := CurArr;
         Sink.Index := Idx;
         Sink.UseIndex := True;
         Exit;
       end;
-      CurItem := CurArr.Items[Idx];
-      CurArr := nil;
-      if P^ <> '.' then
+      Item := CurArr.Items[Idx];
+      case P^ of
+        '.':
+          begin
+            Inc(P);
+            EnterItem(Item, False);
+          end;
+        '[':
+          EnterItem(Item, True);
+      else
         PathError(APath);
-      Inc(P);
-      if CurItem.IsNull then
-        PathNullError(APath);
-      CurObj := CurItem.ObjectValue;
-      CurItem := nil;
+      end;
     end
     else
     begin
       Name := ParseName(P, APath);
-      Last := P^ = #0;
-      if CurObj = nil then
-      begin
-        if CurItem = nil then
-          PathError(APath);
-        if CurItem.IsNull then
-          PathNullError(APath);
-        CurObj := CurItem.ObjectValue;
-        CurItem := nil;
-      end;
-      if Last then
+      if P^ = #0 then
       begin
         Sink.ParentObj := CurObj;
         Sink.Name := Name;
         Exit;
       end;
-      Idx := CurObj.IndexOf(Name);
-      if P^ = '.' then
+      if not CharInSet(P^, ['.', '[']) then
+        PathError(APath);
+      if Virt then
+        Idx := -1
+      else
+        Idx := CurObj.IndexOf(Name);
+      if Idx >= 0 then
+        EnterItem(CurObj.Items[Idx], P^ = '[')
+      else if ADryRun then
       begin
-        if Idx < 0 then
-          CurObj := CurObj.O[Name]
-        else
-        begin
-          CurItem := CurObj.Items[Idx];
-          if CurItem.IsNull then
-            PathNullError(APath);
-          CurObj := CurItem.ObjectValue;
-          CurItem := nil;
-        end;
-        Inc(P);
+        Virt := True;
+        InArr := P^ = '[';
+        CurObj := nil;
+        CurArr := nil;
       end
       else if P^ = '[' then
       begin
-        if Idx < 0 then
-          CurArr := CurObj.A[Name]
-        else
-        begin
-          CurItem := CurObj.Items[Idx];
-          if CurItem.IsNull then
-            PathNullError(APath);
-          CurArr := CurItem.ArrayValue;
-          CurItem := nil;
-        end;
+        CurArr := CurObj.A[Name];
         CurObj := nil;
+        InArr := True;
       end
       else
-        PathError(APath);
+        CurObj := CurObj.O[Name];
+      if P^ = '.' then
+        Inc(P);
     end;
   end;
+end;
+
+procedure WalkWrite(ADoc: TJsonBaseObject; const APath: string; out Sink: TSink);
+begin
+  WalkWritePass(ADoc, APath, True, Sink);
+  WalkWritePass(ADoc, APath, False, Sink);
+end;
+
+{ Count of the array at APath for write-side validation; 0 if it does not exist yet
+  (ADD/INS will create it). Raises if the node exists and is not an array. }
+function ArrayCountForWrite(ADoc: TJsonBaseObject; const APath: string): Integer;
+var
+  Item: PJsonDataValue;
+  Root, Found: Boolean;
+begin
+  Result := 0;
+  if APath = '' then
+  begin
+    if ADoc is TJsonArray then
+      Result := TJsonArray(ADoc).Count;
+    Exit;
+  end;
+  WalkRead(ADoc, APath, Item, Root, Found);
+  if Found and (Item <> nil) and (not Item.IsNull) then
+  begin
+    if Item.Typ <> jdtArray then
+      raise EJsonUdr.Create('ADD/INSERT path is not an array');
+    Result := Item.ArrayValue.Count;
+  end;
+end;
+
+procedure CheckInsIndex(ADoc: TJsonBaseObject; const APath: string; AIndex: Integer);
+var
+  N: Integer;
+begin
+  N := ArrayCountForWrite(ADoc, APath);
+  if (AIndex < 0) or (AIndex > N) then
+    raise EJsonUdr.CreateFmt('INSERT index %d out of bounds (0..%d) "%s"',
+      [AIndex, N, APath]);
 end;
 
 function ItemIsNull(AItem: PJsonDataValue): Boolean;
@@ -525,8 +590,14 @@ begin
           Wrap.Add(AItem.IntValue);
         jdtLong:
           Wrap.Add(AItem.LongValue);
+        jdtULong:
+          Wrap.Add(AItem.ULongValue);
         jdtFloat:
           Wrap.Add(AItem.FloatValue);
+        jdtDateTime:
+          Wrap.Add(AItem.DateTimeValue);
+        jdtUtcDateTime:
+          Wrap.AddUtcDateTime(AItem.UtcDateTimeValue);
         jdtBool:
           Wrap.Add(AItem.BoolValue);
       else
@@ -545,8 +616,8 @@ function ItemToScalarText(AItem: PJsonDataValue): string;
 begin
   if (AItem = nil) or AItem.IsNull then
     Exit('null');
-  if AItem.Typ = jdtString then
-    Exit(AItem.Value);
+  if AItem.Typ in [jdtString, jdtDateTime, jdtUtcDateTime] then
+    Exit(AItem.Value);  { as GET_S: ISO text without JSON quotes }
   Result := ItemToJson(AItem, True);
 end;
 
@@ -916,8 +987,14 @@ begin
       AObj.I[AName] := ASrc.IntValue;
     jdtLong:
       AObj.L[AName] := ASrc.LongValue;
+    jdtULong:
+      AObj.U[AName] := ASrc.ULongValue;
     jdtFloat:
       AObj.F[AName] := ASrc.FloatValue;
+    jdtDateTime:
+      AObj.D[AName] := ASrc.DateTimeValue;
+    jdtUtcDateTime:
+      AObj.DUtc[AName] := ASrc.UtcDateTimeValue;
     jdtBool:
       AObj.B[AName] := ASrc.BoolValue;
     jdtArray:
@@ -926,6 +1003,74 @@ begin
       AObj.O[AName] := TJsonObject(ASrc.ObjectValue.Clone);
   else
     AObj.S[AName] := ASrc.Value;
+  end;
+end;
+
+{ Append a copy of ASrc to AArr (all JDO value types, null included). }
+procedure AddItemToArray(AArr: TJsonArray; ASrc: PJsonDataValue);
+begin
+  if ASrc.IsNull then
+  begin
+    AArr.AddObject(nil);
+    Exit;
+  end;
+  case ASrc.Typ of
+    jdtString:
+      AArr.Add(ASrc.Value);
+    jdtInt:
+      AArr.Add(ASrc.IntValue);
+    jdtLong:
+      AArr.Add(ASrc.LongValue);
+    jdtULong:
+      AArr.Add(ASrc.ULongValue);
+    jdtFloat:
+      AArr.Add(ASrc.FloatValue);
+    jdtDateTime:
+      AArr.Add(ASrc.DateTimeValue);
+    jdtUtcDateTime:
+      AArr.AddUtcDateTime(ASrc.UtcDateTimeValue);
+    jdtBool:
+      AArr.Add(ASrc.BoolValue);
+    jdtArray:
+      AArr.Add(TJsonArray(ASrc.ArrayValue.Clone));
+    jdtObject:
+      AArr.Add(TJsonObject(ASrc.ObjectValue.Clone));
+  else
+    AArr.Add(ASrc.Value);
+  end;
+end;
+
+{ Insert a copy of ASrc at AIndex (caller has validated AIndex). }
+procedure InsertItemToArray(AArr: TJsonArray; AIndex: Integer; ASrc: PJsonDataValue);
+begin
+  if ASrc.IsNull then
+  begin
+    AArr.InsertObject(AIndex, nil);
+    Exit;
+  end;
+  case ASrc.Typ of
+    jdtString:
+      AArr.Insert(AIndex, ASrc.Value);
+    jdtInt:
+      AArr.Insert(AIndex, ASrc.IntValue);
+    jdtLong:
+      AArr.Insert(AIndex, ASrc.LongValue);
+    jdtULong:
+      AArr.Insert(AIndex, ASrc.ULongValue);
+    jdtFloat:
+      AArr.Insert(AIndex, ASrc.FloatValue);
+    jdtDateTime:
+      AArr.Insert(AIndex, ASrc.DateTimeValue);
+    jdtUtcDateTime:
+      AArr.InsertUtcDateTime(AIndex, ASrc.UtcDateTimeValue);
+    jdtBool:
+      AArr.Insert(AIndex, ASrc.BoolValue);
+    jdtArray:
+      AArr.Insert(AIndex, TJsonArray(ASrc.ArrayValue.Clone));
+    jdtObject:
+      AArr.Insert(AIndex, TJsonObject(ASrc.ObjectValue.Clone));
+  else
+    AArr.Insert(AIndex, ASrc.Value);
   end;
 end;
 
@@ -943,8 +1088,14 @@ begin
       AArr.I[AIndex] := ASrc.IntValue;
     jdtLong:
       AArr.L[AIndex] := ASrc.LongValue;
+    jdtULong:
+      AArr.U[AIndex] := ASrc.ULongValue;
     jdtFloat:
       AArr.F[AIndex] := ASrc.FloatValue;
+    jdtDateTime:
+      AArr.D[AIndex] := ASrc.DateTimeValue;
+    jdtUtcDateTime:
+      AArr.DUtc[AIndex] := ASrc.UtcDateTimeValue;
     jdtBool:
       AArr.B[AIndex] := ASrc.BoolValue;
     jdtArray:
@@ -1052,9 +1203,9 @@ var
   Src: PJsonDataValue;
 begin
   NeedWritePath(APath);
-  WalkWrite(ADoc, APath, Sink);
-  Wrap := JsonParseLiteral(AJsonValue);
+  Wrap := JsonParseLiteral(AJsonValue);  { invalid literal -> error before any write }
   try
+    WalkWrite(ADoc, APath, Sink);
     Src := Wrap.Items[Wrap.IndexOf('$')];
     if Sink.UseIndex then
       AssignItemToArray(Sink.ParentArr, Sink.Index, Src)
@@ -1076,9 +1227,9 @@ var
   C: TJsonBaseObject;
 begin
   NeedWritePath(APath);
-  WalkWrite(ADoc, APath, Sink);
-  C := ASrc.Clone;
+  C := ASrc.Clone;  { clone first: ASrc may be ADoc itself }
   try
+    WalkWrite(ADoc, APath, Sink);
     if C is TJsonArray then
     begin
       if Sink.UseIndex then
@@ -1117,10 +1268,55 @@ begin
     Sink.ParentObj.Remove(Sink.Name);
 end;
 
+{ Object/array stored at the sink; created when missing or JSON null
+  (JDO A[]/O[] return nil for a null slot). Wrong type -> exception. }
+function SinkContainer(const Sink: TSink; AArray: Boolean): TJsonBaseObject;
+var
+  Item: PJsonDataValue;
+  Idx: Integer;
+begin
+  Item := nil;
+  if Sink.UseIndex then
+    Item := Sink.ParentArr.Items[Sink.Index]
+  else
+  begin
+    Idx := Sink.ParentObj.IndexOf(Sink.Name);
+    if Idx >= 0 then
+      Item := Sink.ParentObj.Items[Idx];
+  end;
+  if (Item <> nil) and not Item.IsNull then
+  begin
+    if AArray then
+    begin
+      if Item.Typ <> jdtArray then
+        raise EJsonUdr.Create('JSON path is not an array');
+      Exit(Item.ArrayValue);
+    end;
+    if Item.Typ <> jdtObject then
+      raise EJsonUdr.Create('JSON path is not an object');
+    Exit(Item.ObjectValue);
+  end;
+  if AArray then
+  begin
+    Result := TJsonArray.Create;
+    if Sink.UseIndex then
+      Sink.ParentArr.A[Sink.Index] := TJsonArray(Result)
+    else
+      Sink.ParentObj.A[Sink.Name] := TJsonArray(Result);
+  end
+  else
+  begin
+    Result := TJsonObject.Create;
+    if Sink.UseIndex then
+      Sink.ParentArr.O[Sink.Index] := TJsonObject(Result)
+    else
+      Sink.ParentObj.O[Sink.Name] := TJsonObject(Result);
+  end;
+end;
+
 function RequireArray(ADoc: TJsonBaseObject; const APath: string): TJsonArray;
 var
   Sink: TSink;
-  Idx: Integer;
 begin
   if APath = '' then
   begin
@@ -1129,21 +1325,18 @@ begin
     Result := TJsonArray(ADoc);
     Exit;
   end;
+  ArrayCountForWrite(ADoc, APath);  { type check before anything is created }
   WalkWrite(ADoc, APath, Sink);
-  if Sink.UseIndex then
-    Result := Sink.ParentArr.A[Sink.Index]
-  else
-  begin
-    Idx := Sink.ParentObj.IndexOf(Sink.Name);
-    if Idx < 0 then
-      Result := Sink.ParentObj.A[Sink.Name]
-    else if Sink.ParentObj.Items[Idx].Typ = jdtArray then
-      Result := Sink.ParentObj.A[Sink.Name]
-    else if Sink.ParentObj.Items[Idx].IsNull then
-      Result := Sink.ParentObj.A[Sink.Name]
-    else
-      raise EJsonUdr.Create('ADD/INSERT path is not an array');
-  end;
+  Result := SinkContainer(Sink, True) as TJsonArray;
+end;
+
+{ RequireArray for INS_*: index 0..Count is checked before the array or its
+  parents are created. }
+function RequireInsArray(ADoc: TJsonBaseObject; const APath: string;
+  AIndex: Integer): TJsonArray;
+begin
+  CheckInsIndex(ADoc, APath, AIndex);
+  Result := RequireArray(ADoc, APath);
 end;
 
 procedure JsonAddS(ADoc: TJsonBaseObject; const APath, AValue: string);
@@ -1192,31 +1385,11 @@ var
   Wrap: TJsonObject;
   Src: PJsonDataValue;
 begin
-  Arr := RequireArray(ADoc, APath);
-  Wrap := JsonParseLiteral(AJsonValue);
+  Wrap := JsonParseLiteral(AJsonValue);  { invalid literal -> error before any write }
   try
+    Arr := RequireArray(ADoc, APath);
     Src := Wrap.Items[Wrap.IndexOf('$')];
-    if Src.IsNull then
-      Arr.AddObject(nil)
-    else
-      case Src.Typ of
-        jdtString:
-          Arr.Add(Src.Value);
-        jdtInt:
-          Arr.Add(Src.IntValue);
-        jdtLong:
-          Arr.Add(Src.LongValue);
-        jdtFloat:
-          Arr.Add(Src.FloatValue);
-        jdtBool:
-          Arr.Add(Src.BoolValue);
-        jdtArray:
-          Arr.Add(TJsonArray(Src.ArrayValue.Clone));
-        jdtObject:
-          Arr.Add(TJsonObject(Src.ObjectValue.Clone));
-      else
-        Arr.Add(Src.Value);
-      end;
+    AddItemToArray(Arr, Src);
   finally
     Wrap.Free;
   end;
@@ -1227,9 +1400,9 @@ var
   Arr: TJsonArray;
   C: TJsonBaseObject;
 begin
-  Arr := RequireArray(ADoc, APath);
-  C := ASrc.Clone;
+  C := ASrc.Clone;  { clone first: ASrc may be ADoc itself }
   try
+    Arr := RequireArray(ADoc, APath);
     if C is TJsonArray then
       Arr.Add(TJsonArray(C))
     else
@@ -1242,42 +1415,42 @@ end;
 
 procedure JsonInsS(ADoc: TJsonBaseObject; const APath: string; AIndex: Integer; const AValue: string);
 begin
-  RequireArray(ADoc, APath).Insert(AIndex, AValue);
+  RequireInsArray(ADoc, APath, AIndex).Insert(AIndex, AValue);
 end;
 
 procedure JsonInsI(ADoc: TJsonBaseObject; const APath: string; AIndex, AValue: Integer);
 begin
-  RequireArray(ADoc, APath).Insert(AIndex, AValue);
+  RequireInsArray(ADoc, APath, AIndex).Insert(AIndex, AValue);
 end;
 
 procedure JsonInsL(ADoc: TJsonBaseObject; const APath: string; AIndex: Integer; AValue: Int64);
 begin
-  RequireArray(ADoc, APath).Insert(AIndex, AValue);
+  RequireInsArray(ADoc, APath, AIndex).Insert(AIndex, AValue);
 end;
 
 procedure JsonInsF(ADoc: TJsonBaseObject; const APath: string; AIndex: Integer; AValue: Double);
 begin
-  RequireArray(ADoc, APath).Insert(AIndex, AValue);
+  RequireInsArray(ADoc, APath, AIndex).Insert(AIndex, AValue);
 end;
 
 procedure JsonInsB(ADoc: TJsonBaseObject; const APath: string; AIndex: Integer; AValue: Boolean);
 begin
-  RequireArray(ADoc, APath).Insert(AIndex, AValue);
+  RequireInsArray(ADoc, APath, AIndex).Insert(AIndex, AValue);
 end;
 
 procedure JsonInsD(ADoc: TJsonBaseObject; const APath: string; AIndex: Integer; AValue: TDateTime);
 begin
-  RequireArray(ADoc, APath).Insert(AIndex, AValue);
+  RequireInsArray(ADoc, APath, AIndex).Insert(AIndex, AValue);
 end;
 
 procedure JsonInsA(ADoc: TJsonBaseObject; const APath: string; AIndex: Integer);
 begin
-  RequireArray(ADoc, APath).InsertArray(AIndex);
+  RequireInsArray(ADoc, APath, AIndex).InsertArray(AIndex);
 end;
 
 procedure JsonInsO(ADoc: TJsonBaseObject; const APath: string; AIndex: Integer);
 begin
-  RequireArray(ADoc, APath).InsertObject(AIndex);
+  RequireInsArray(ADoc, APath, AIndex).InsertObject(AIndex);
 end;
 
 procedure JsonInsJson(ADoc: TJsonBaseObject; const APath: string; AIndex: Integer;
@@ -1287,31 +1460,11 @@ var
   Wrap: TJsonObject;
   Src: PJsonDataValue;
 begin
-  Arr := RequireArray(ADoc, APath);
-  Wrap := JsonParseLiteral(AJsonValue);
+  Wrap := JsonParseLiteral(AJsonValue);  { invalid literal -> error before any write }
   try
+    Arr := RequireInsArray(ADoc, APath, AIndex);
     Src := Wrap.Items[Wrap.IndexOf('$')];
-    if Src.IsNull then
-      Arr.InsertObject(AIndex, nil)
-    else
-      case Src.Typ of
-        jdtString:
-          Arr.Insert(AIndex, Src.Value);
-        jdtInt:
-          Arr.Insert(AIndex, Src.IntValue);
-        jdtLong:
-          Arr.Insert(AIndex, Src.LongValue);
-        jdtFloat:
-          Arr.Insert(AIndex, Src.FloatValue);
-        jdtBool:
-          Arr.Insert(AIndex, Src.BoolValue);
-        jdtArray:
-          Arr.Insert(AIndex, TJsonArray(Src.ArrayValue.Clone));
-        jdtObject:
-          Arr.Insert(AIndex, TJsonObject(Src.ObjectValue.Clone));
-      else
-        Arr.Insert(AIndex, Src.Value);
-      end;
+    InsertItemToArray(Arr, AIndex, Src);
   finally
     Wrap.Free;
   end;
@@ -1323,9 +1476,9 @@ var
   Arr: TJsonArray;
   C: TJsonBaseObject;
 begin
-  Arr := RequireArray(ADoc, APath);
-  C := ASrc.Clone;
+  C := ASrc.Clone;  { clone first: ASrc may be ADoc itself }
   try
+    Arr := RequireInsArray(ADoc, APath, AIndex);
     if C is TJsonArray then
       Arr.Insert(AIndex, TJsonArray(C))
     else
@@ -1371,23 +1524,14 @@ begin
       raise EJsonUdr.Create('ASSIGN root type mismatch');
     Exit;
   end;
-  WalkWrite(ADoc, APath, Sink);
-  if ASrc is TJsonObject then
-  begin
-    if Sink.UseIndex then
-      Sink.ParentArr.O[Sink.Index].Assign(TJsonObject(ASrc))
-    else
-      Sink.ParentObj.O[Sink.Name].Assign(TJsonObject(ASrc));
-  end
-  else if ASrc is TJsonArray then
-  begin
-    if Sink.UseIndex then
-      Sink.ParentArr.A[Sink.Index].Assign(TJsonArray(ASrc))
-    else
-      Sink.ParentObj.A[Sink.Name].Assign(TJsonArray(ASrc));
-  end
-  else
+  if not ((ASrc is TJsonObject) or (ASrc is TJsonArray)) then
     raise EJsonUdr.Create('ASSIGN source is not an object or array');
+  WalkWrite(ADoc, APath, Sink);
+  { missing or JSON null target -> created; other type -> exception }
+  if ASrc is TJsonObject then
+    TJsonObject(SinkContainer(Sink, False)).Assign(TJsonObject(ASrc))
+  else
+    TJsonArray(SinkContainer(Sink, True)).Assign(TJsonArray(ASrc));
 end;
 
 procedure JsonClear(ADoc: TJsonBaseObject; const APath: string);
@@ -1494,10 +1638,16 @@ begin
 end;
 
 procedure JsonDeleteOf(ADoc: TJsonBaseObject; const APath: string; AIndex: Integer);
+var
+  Obj: TJsonObject;
 begin
   if AIndex < 0 then
     raise EJsonUdr.Create('DELETEOF index must be >= 0');
-  ObjectAt(ADoc, APath).Delete(AIndex);
+  Obj := ObjectAt(ADoc, APath);
+  if AIndex >= Obj.Count then
+    raise EJsonUdr.CreateFmt('DELETEOF index %d out of bounds (%d) "%s"',
+      [AIndex, Obj.Count, APath]);
+  Obj.Delete(AIndex);
 end;
 
 function JsonExtract(ADoc: TJsonBaseObject; const APath: string; out AJson: string): Boolean;

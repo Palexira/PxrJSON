@@ -6,7 +6,14 @@ uses
   System.SysUtils, System.Generics.Collections, JsonDataObjects;
 
 const
+  { Hash LRU of JSON texts per attachment: at most JsonHashCacheLimit texts and
+    at most JsonHashCacheMaxChars characters of text in total (the parsed trees
+    come on top). The two most recently used texts are never evicted by the
+    size limit: a single document larger than the limit still works, and a
+    call that resolves two texts (ASSIGN: target + source) never loses the
+    first tree while the second one is being cached. }
   JsonHashCacheLimit = 64;
+  JsonHashCacheMaxChars = 16 * 1024 * 1024;
 
 type
   TJsonSessionCache = class
@@ -15,9 +22,11 @@ type
     FMap: TDictionary<UInt64, TObject>;
     FLru: TList<TObject>;
     FUuid: TDictionary<string, TJsonBaseObject>;
+    FTextChars: Int64;
     function HashOf(const AText: string): UInt64;
     procedure Touch(ASlot: TObject);
     procedure Evict(ASlot: TObject);
+    procedure TrimSize;
     procedure InsertSlot(AHash: UInt64; const AText: string; ATree: TJsonBaseObject);
     function NewKey: string;
     function AdoptTree(ATree: TJsonBaseObject): string;
@@ -28,6 +37,7 @@ type
     function Release: Integer;
     function Ensure(const AText: string): TJsonBaseObject;
     procedure Rekey(const AOldText, ANewText: string; ATree: TJsonBaseObject);
+    procedure Forget(const AText: string);
     function Resolve(const AText: string): TJsonBaseObject;
     function TryUuid(const AText: string; out ATree: TJsonBaseObject): Boolean;
     function ParseNew(const AText: string): string;
@@ -118,8 +128,13 @@ end;
 
 function TJsonSessionCache.Release: Integer;
 begin
-  Dec(FRef);
-  Result := FRef;
+  GLock.Enter;
+  try
+    Dec(FRef);
+    Result := FRef;
+  finally
+    GLock.Leave;
+  end;
 end;
 
 {$IFOPT Q+}
@@ -162,9 +177,17 @@ end;
 
 procedure TJsonSessionCache.Evict(ASlot: TObject);
 begin
+  Dec(FTextChars, Length(TJsonHashSlot(ASlot).Text));
   FMap.Remove(TJsonHashSlot(ASlot).Hash);
   FLru.Remove(ASlot);
   ASlot.Free;
+end;
+
+procedure TJsonSessionCache.TrimSize;
+begin
+  { keep the two most recent slots (see JsonHashCacheMaxChars) }
+  while (FLru.Count > 2) and (FTextChars > JsonHashCacheMaxChars) do
+    Evict(FLru[0]);
 end;
 
 procedure TJsonSessionCache.InsertSlot(AHash: UInt64; const AText: string;
@@ -183,6 +206,18 @@ begin
   Slot.Tree := ATree;
   FMap.Add(AHash, Slot);
   FLru.Add(Slot);
+  Inc(FTextChars, Length(AText));
+  TrimSize;
+end;
+
+procedure TJsonSessionCache.Forget(const AText: string);
+var
+  Obj: TObject;
+begin
+  { Drop the cached tree of this text (used after a failed write on a text
+    argument: the tree may no longer match the text). }
+  if FMap.TryGetValue(HashOf(AText), Obj) and (TJsonHashSlot(Obj).Text = AText) then
+    Evict(Obj);
 end;
 
 function TJsonSessionCache.Ensure(const AText: string): TJsonBaseObject;
@@ -219,10 +254,12 @@ begin
   if FMap.TryGetValue(HOld, Obj) and (TJsonHashSlot(Obj).Tree = ATree) then
   begin
     Slot := TJsonHashSlot(Obj);
+    Inc(FTextChars, Length(ANewText) - Length(Slot.Text));
     if HOld = HNew then
     begin
       Slot.Text := ANewText;
       Touch(Slot);
+      TrimSize;
       Exit;
     end;
     FMap.Remove(HOld);
@@ -232,6 +269,7 @@ begin
     Slot.Text := ANewText;
     FMap.Add(HNew, Slot);
     Touch(Slot);
+    TrimSize;
   end
   else
     InsertSlot(HNew, ANewText, ATree);
